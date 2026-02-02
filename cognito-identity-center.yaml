@@ -1,0 +1,227 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Cognito User Pool with AWS Identity Center (SAML) integration for Grafana'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name
+
+  GrafanaCallbackURL:
+    Type: String
+    Default: 'http://localhost:3000/login/generic_oauth'
+    Description: Grafana OAuth callback URL
+
+  GrafanaLogoutURL:
+    Type: String
+    Default: 'http://localhost:3000/logout'
+    Description: Grafana logout URL
+
+  # Identity Center の SAML メタデータ URL は後で手動設定が必要
+  # または SAML メタデータ XML を直接指定
+
+Resources:
+  #============================================================================
+  # Cognito User Pool
+  #============================================================================
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub 'grafana-userpool-${Environment}'
+      
+      # ユーザー名の設定（メールアドレスをユーザー名として使用）
+      UsernameAttributes:
+        - email
+      
+      # 自動検証
+      AutoVerifiedAttributes:
+        - email
+      
+      # パスワードポリシー（Identity Center 経由なので緩めでOK）
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: true
+      
+      # スキーマ属性（グループ情報を保持するカスタム属性）
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+        - Name: groups
+          AttributeDataType: String
+          Mutable: true
+          Required: false
+      
+      # アカウント復旧設定
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      
+      # 管理者によるユーザー作成設定
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+      
+
+  #============================================================================
+  # Cognito User Pool Domain (Cognito ホストUI用)
+  #============================================================================
+  CognitoUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub 'grafana-${Environment}-${AWS::AccountId}'
+      UserPoolId: !Ref CognitoUserPool
+
+  #============================================================================
+  # Cognito User Pool Client (Grafana用)
+  # ※ SAML IdP 設定後に SupportedIdentityProviders を更新する必要あり
+  #============================================================================
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub 'grafana-client-${Environment}'
+      UserPoolId: !Ref CognitoUserPool
+      
+      # クライアントシークレットを生成
+      GenerateSecret: true
+      
+      # OAuth 設定
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes:
+        - openid
+        - email
+        - profile
+      
+      # コールバック URL
+      CallbackURLs:
+        - !Ref GrafanaCallbackURL
+      
+      # ログアウト URL
+      LogoutURLs:
+        - !Ref GrafanaLogoutURL
+      
+      # サポートする Identity Provider
+      # ※ 初期状態では COGNITO のみ。SAML IdP 設定後にコンソールで追加
+      SupportedIdentityProviders:
+        - COGNITO
+      
+      # トークン有効期限
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+      
+      # 属性の読み取り権限
+      ReadAttributes:
+        - email
+        - email_verified
+        - name
+        - custom:groups
+      
+      # 属性の書き込み権限
+      WriteAttributes:
+        - email
+        - name
+        - custom:groups
+
+  #============================================================================
+  # NOTE: Identity Center SAML Identity Provider は手動で設定
+  #============================================================================
+  # SAML IdP は CloudFormation でプレースホルダーを作成できないため、
+  # 以下の手順で手動設定が必要:
+  #
+  # 1. Identity Center で SAML アプリを作成（ACS URL と Audience URI を使用）
+  # 2. SAML メタデータをダウンロード
+  # 3. Cognito コンソールで「フェデレーテッド ID プロバイダー」を追加
+  # 4. User Pool Client の SupportedIdentityProviders に追加
+  #
+  # 詳細は Output の SetupInstructions を参照
+
+#============================================================================
+# Outputs
+#============================================================================
+Outputs:
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref CognitoUserPool
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolId'
+
+  UserPoolArn:
+    Description: Cognito User Pool ARN
+    Value: !GetAtt CognitoUserPool.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolArn'
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID (Grafana の GF_AUTH_GENERIC_OAUTH_CLIENT_ID に設定)
+    Value: !Ref CognitoUserPoolClient
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolClientId'
+
+  CognitoDomain:
+    Description: Cognito Domain
+    Value: !Sub 'grafana-${Environment}-${AWS::AccountId}'
+    Export:
+      Name: !Sub '${AWS::StackName}-CognitoDomain'
+
+  CognitoIssuerURL:
+    Description: Cognito Issuer URL
+    Value: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPool}'
+    Export:
+      Name: !Sub '${AWS::StackName}-IssuerURL'
+
+  AuthorizationEndpoint:
+    Description: OAuth2 Authorization Endpoint (Grafana の GF_AUTH_GENERIC_OAUTH_AUTH_URL に設定)
+    Value: !Sub 'https://grafana-${Environment}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com/oauth2/authorize'
+    Export:
+      Name: !Sub '${AWS::StackName}-AuthorizationEndpoint'
+
+  TokenEndpoint:
+    Description: OAuth2 Token Endpoint (Grafana の GF_AUTH_GENERIC_OAUTH_TOKEN_URL に設定)
+    Value: !Sub 'https://grafana-${Environment}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com/oauth2/token'
+    Export:
+      Name: !Sub '${AWS::StackName}-TokenEndpoint'
+
+  UserInfoEndpoint:
+    Description: OAuth2 UserInfo Endpoint (Grafana の GF_AUTH_GENERIC_OAUTH_API_URL に設定)
+    Value: !Sub 'https://grafana-${Environment}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com/oauth2/userInfo'
+    Export:
+      Name: !Sub '${AWS::StackName}-UserInfoEndpoint'
+
+  LogoutEndpoint:
+    Description: OAuth2 Logout Endpoint
+    Value: !Sub 'https://grafana-${Environment}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com/logout'
+    Export:
+      Name: !Sub '${AWS::StackName}-LogoutEndpoint'
+
+  SAMLAcsURL:
+    Description: SAML ACS URL (Identity Center の SAML アプリ設定で使用)
+    Value: !Sub 'https://grafana-${Environment}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com/saml2/idpresponse'
+    Export:
+      Name: !Sub '${AWS::StackName}-SAMLAcsURL'
+
+  SAMLAudienceURI:
+    Description: SAML Audience URI / Entity ID (Identity Center の SAML アプリ設定で使用)
+    Value: !Sub 'urn:amazon:cognito:sp:${CognitoUserPool}'
+    Export:
+      Name: !Sub '${AWS::StackName}-SAMLAudienceURI'
+
+  ClientSecretCommand:
+    Description: AWS CLI command to get the Client Secret
+    Value: !Sub |
+      aws cognito-idp describe-user-pool-client --user-pool-id ${CognitoUserPool} --client-id ${CognitoUserPoolClient} --query 'UserPoolClient.ClientSecret' --output text
